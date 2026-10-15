@@ -1,0 +1,10 @@
+{
+	"id": "mail-for-outlook",
+	"name": "Mail for Outlook",
+	"version": "1.3.1",
+	"minAppVersion": "1.5.7",
+	"description": "Send notes as Outlook email drafts, or copy them as rich text to paste into OneNote, Jira or other apps.",
+	"author": "SpinEchoArcanist",
+	"authorUrl": "https://github.com/SpinEchoArcanist",
+	"isDesktopOnly": true
+}
