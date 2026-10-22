@@ -1,6 +1,6 @@
 # 📧 Mail for Outlook
 
-Share an Obsidian note, or part of it, without leaving Obsidian: open it as an **Outlook email draft**, or **copy it as rich text** to paste into OneNote, Jira, Teams or any app that accepts formatted text.
+Share an Obsidian note, or part of it, without leaving Obsidian: open it as an **Outlook email draft**, or **copy it as rich text** to paste into OneNote, Jira, Teams or any app that accepts formatted text. And the other way round: **import an email** copied from Outlook as a searchable note, with its people linked to your person notes.
 
 Before anything leaves your vault, the note is cleaned up for its readers: private parts are removed, queries become their results, embedded notes are filled in and links into your vault become plain text.
 
@@ -21,6 +21,7 @@ Based on [obsidian-mail-plugin](https://github.com/droezel/obsidian-mail-plugin)
 - 📊 **Dataview and Tasks queries** are replaced by their results.
 - ☑️ **Task checkboxes** are shown as ☐ and ☑, which every app can display.
 - ⏳ **Progress at a glance**: one notice shows the export's progress and turns into ✅ when it's done.
+- 📥 **Import an email** from Outlook as a note: header turned into properties, people linked to person notes, duplicates detected. Works with a Templater template, or without Templater.
 
 ## 📋 Why copy as rich text?
 
@@ -49,6 +50,7 @@ Add this repository `SpinEchoArcanist/obsidian-mail-for-outlook` in BRAT ("Add a
 | ⌨️ Command **Mail for Outlook: Send selection as email** | Opens only the selected text as an email draft (available when something is selected) |
 | ⌨️ Command **Mail for Outlook: Copy note as rich text** | Copies the whole active note to the clipboard |
 | ⌨️ Command **Mail for Outlook: Copy selection as rich text** | Copies only the selected text to the clipboard (available when something is selected) |
+| ⌨️ Command **Mail for Outlook: Import email** | Creates a note from the email copied from Outlook, or a blank email note when there is none (see Importing an email) |
 
 For an email, the subject is the note's name. The draft opens in your email client; nothing is sent until you press Send.
 
@@ -76,6 +78,69 @@ The copy commands go through exactly the same steps as an email: the privacy fil
 - 🖼️ **Images** from your vault are written into the copied content itself, since a clipboard can't carry attachments. They paste into OneNote and Word. Web apps such as Jira or Confluence usually only accept images uploaded as attachments, so images may be dropped there. Images from the web stay as links to the web.
 - 📝 **Plain-text fallback**: apps that only accept plain text receive the visible text, without formatting.
 - 🎨 **Formatting** depends on the app you paste into: headings, lists, tables, links and bold or italic text are usually kept; colours, code styling and callouts may be simplified.
+
+## 📥 Importing an email
+
+Archive an email from Outlook as an Obsidian note, so its text is searchable and linked to the people involved. The email itself stays in Outlook: the note keeps its subject and sent time so you can find the original (attachments, images) there.
+
+### Setup (once)
+
+1. Copy `templates/Email Template.md` from the release zip into your Templater templates folder, and set its path in **Settings → Mail for Outlook → Import → Email template (Templater)**, for example `Templates/Email Template.md`.
+2. Optional, for when Templater is not available: copy `templates/Email Template (fallback).md` too and set it in **Fallback template**. Without it, the same built-in content is used.
+3. Give **Mail for Outlook: Import email** a hotkey in **Settings → Hotkeys**.
+
+### Every time
+
+1. In Outlook (classic, new or web): open the email → **Forward** → **Ctrl+A** → **Ctrl+C** → discard the draft. Forward is used because it makes Outlook write the full header (De / Envoyé / À / Cc / Objet, or From / Sent / To / Cc / Subject). Your signature in the draft doesn't matter: everything above the header is dropped.
+2. In Obsidian, press your hotkey. Confirm the title (prefilled with the subject), and the people window if it opens.
+
+The note is created in `2 Mail/Liste Emails/`, named `✉️ <title>`, with these properties: `Type`, `Creation date`, `Envoyé:`, `De:`, `A:`, `Cc:`, `Objet`, `Tags`, `Comment`, then a `# [[note name]]` heading and the email from its header down. Images are not imported. Folder, prefix, properties and layout are decided by the template: to change them, edit the template.
+
+Run with no Outlook email on the clipboard, the same command creates a **blank email note** with the same properties.
+
+### What the plugin reads
+
+- 🔎 **The header**: the first From line followed, within the next 6 lines, by a Sent and a Subject line. Older headers lower in the thread are ignored. French and English labels, with or without a space before `:`.
+- 📅 **The sent date**: French (`mercredi 29 juillet 2026 19:30`), English (`Wednesday, July 29, 2026 7:30 PM`) or numeric, day first (`29.07.2026 19:30`, `29/07/2026 19:30`). A date it can't read leaves `Envoyé:` empty.
+- 👥 **People** in From, To and Cc, separated by `;`. A comma alone doesn't separate people, so `Martin, Paul <paul.martin@example.com>` stays one person.
+
+### 👥 People and person notes
+
+Each person becomes a link to their person note (`[[Paul Martin]]`), otherwise to their address (`[[paul.martin@example.com]]`), otherwise their name as plain text when Outlook showed no address. Person notes are the same as for recipients: notes whose `type` property contains **Person note type**, with addresses in **Email property**.
+
+1. **By address**: the address is in a person note's Email property (written as `x`, `mailto:x` or `[x](mailto:x)`) → linked directly.
+2. **By name**: the name matches a person note's name or one of its aliases, in any word order, ignoring accents, case, commas and codes in brackets. `Martin Paul (ABC)` matches the note `Paul Martin`.
+3. **Closest names**: if no name matches exactly, up to 3 notes with a similar name are offered, to catch spelling variants (`Martinez` / `Martines`).
+
+People found by name (2 or 3) are shown in **one window per import**: for each, choose the note (or **No note**) and whether to **Add this address to the note** (on by default for an exact name, off for a similar name; not shown when there is no address). **Confirm** applies your choices: the address is added to the note's Email property (a single value becomes a list; nothing else in the note changes) and a notice tells you how many person notes were updated, so the next import matches them by address. **Skip** or Escape changes nothing: those people get their address link. People with no candidate at all (external contacts) get their address link without asking.
+
+### Already archived? Numbering
+
+- If a note with the same name and the same sent time is already in the folder, you are asked: **⛔ Annuler** or **✅ Importer quand même** (the copy then gets a number).
+- Otherwise, a name already taken gets the next free number without asking: a later reply in the same thread becomes `✉️ RE Budget - 2`, then `- 3`.
+
+### With or without Templater
+
+- **Templater enabled** and **Email template** set: the command creates a new note from that template (Templater's "Create new note from template"). The template can also be run from Templater directly, with "Create new note from template" or "Insert template" on a new, empty note; text already in the note is kept below the heading.
+- **Templater not installed, disabled, or no Email template set**: a notice says *Templater indisponible — modèle de secours utilisé* and the plugin creates the note itself from the **fallback template** (or the built-in default), in **Destination folder**, named **File name prefix** + title. The result has the same properties.
+- If Templater fails during the import, the error is shown and no fallback note is made, so you never get two notes.
+
+**Fallback template tokens** (`{{token}}`, no code): `{{title}}` (final note name), `{{subject}}`, `{{sent}}`, `{{from}}`, `{{to}}`, `{{cc}}`, `{{body}}`, `{{today:FORMAT}}` (a moment.js format, default `YYYY-MM-DD`). Inside the properties, tokens are written as YAML values: text in double quotes, people as a list of links, so subjects with quotes or colons stay valid. In the body, text is written as is and people as comma-separated links. Unknown `{{…}}` and Templater `<% … %>` are left unchanged.
+
+### 🧩 For template authors
+
+Templates reach the plugin like this (same pattern as Dataview):
+
+```js
+const mail = app.plugins.plugins["mail-for-outlook"]?.api;   // undefined if the plugin is off
+const email = mail ? await mail.readEmailFromClipboard() : null;
+```
+
+| Member | Description |
+|---|---|
+| `version` | `1` |
+| `readEmailFromClipboard()` | `null` if the clipboard holds no Outlook header; otherwise `{ subject, sent, sentRaw, from, to, cc, header, body }`. `sent` is `"YYYY-MM-DD HH:mm"` or `null`; `from` / `to` / `cc` are lists of `{ name, address, link }`; `header` is the header block alone and `body` the email from the header down, as markdown. Opens the people window when needed. |
+| `findArchivedName({ folder, baseName, sentProperty, sent })` | `{ name, duplicate }`: `name` is `baseName` or `baseName - N` with the lowest free N; `duplicate` is a note in `folder` named like that whose `sentProperty` equals `sent` (or `null`). |
 
 ## 👥 Recipients
 
@@ -161,10 +226,16 @@ A short description at the top of the settings reminds what the plugin does. The
 | Safety placeholder | `REMOVE-BEFORE-SENDING` | Shown when safety is on. Spaces become dashes, `@` and address punctuation are removed |
 | **👥 Recipients** (email drafts only) | | |
 | From linked person notes | on | Add linked people's addresses |
-| Person note type | `Personne` | Shown when the option above is on. Value of the `type` property that marks a person note |
-| Email property | `Email` | Shown when person notes are on. Property holding their address (name matched without regard to case) |
+| Person note type | `Personne` | Value of the `type` property that marks a person note. Also used by Import email |
+| Email property | `Email` | Property holding their addresses (name matched without regard to case). Also used by Import email, which adds the addresses you confirm |
 | From addresses in the text | on | Add addresses written in the note or its properties |
 | Recipients when sending a selection | Selection only | Selection only, or Whole note |
+| **📥 Import** | | |
+| Email template (Templater) | empty | Path of the Templater template used by Import email |
+| Fallback template | empty | Path of the `{{token}}` template used without Templater; empty = built-in default |
+| Destination folder | `2 Mail/Liste Emails` | Fallback only (the Templater template sets its own) |
+| File name prefix | `✉️ ` | Fallback only |
+| Sent property | `Envoyé:` | Property holding the sent date, for the fallback's duplicate check |
 
 ## 🔧 How it works
 
@@ -176,7 +247,9 @@ A short description at the top of the settings reminds what the plugin does. The
 6. 📧 For an email, an `.eml` draft (with `X-Unsent: 1`) is written to the system's temporary folder, in a `mail-for-outlook` subfolder, and opened with your default email client. Drafts are deleted automatically after 5 minutes, or at the next start of Obsidian.
    📋 For a copy, the result is put on the clipboard as rich text, with plain text as a fallback; no file is written.
 
-🛡️ The plugin makes no network requests and never modifies your notes.
+📥 For **Import email**, the clipboard is read only when you run the command; its HTML is converted with Obsidian's own converter after images are removed.
+
+🛡️ The plugin makes no network requests. Exports never modify your notes; Import email creates the email note and, only when you confirm it, adds addresses to person notes.
 
 ## ⚠️ Limitations
 
@@ -188,6 +261,9 @@ A short description at the top of the settings reminds what the plugin does. The
 - 🔒 **Privacy and queries**: the privacy filter works on the exported note's own text. Tasks or rows that a query collects from private areas of *other* notes are not filtered.
 - 🧩 **Embeds inside code blocks** (`![[…]]` written inside a fenced code block) are also expanded.
 - 🖼️ **Images inside embedded notes** that use a path relative to that note may not be found.
+- 📥 **Import email and Templater**: the plugin calls Templater's internal `create_new_note_from_template` function, which is not a documented API. It checks the function is there before each call; if a Templater update removes it, the fallback template is used instead.
+- 📥 **Import email** reads only the text: attachments, images, `.msg` and `.eml` files are not imported. The clipboard can only be read while Obsidian has the focus.
+- 📥 **Cancelling** (at the title or at the duplicate question) when the Import email command runs through Templater leaves the new, empty note Templater had already created; delete it if you don't need it. The fallback creates nothing when you cancel.
 
 ## 🛠️ Building from source
 
@@ -207,6 +283,14 @@ Licensed under the [Apache License 2.0](LICENSE).
 - Based on [obsidian-mail-plugin](https://github.com/droezel/obsidian-mail-plugin) © Dries Verbruggen, also licensed under the Apache License 2.0. The changes made to the original are listed in the changelog below and in the notice at the top of `main.ts`.
 
 ## 📝 Changelog
+
+### 1.4.0
+- New command **Import email**: turns an email copied from Outlook (Forward → Ctrl+A → Ctrl+C) into a note through a Templater template, or through a built-in `{{token}}` fallback template when Templater is not available. Without an email on the clipboard, it creates a blank email note.
+- People in From, To and Cc linked to person notes by address, by name (any word order, aliases) or by closest name, with a review window that can add confirmed addresses to the person notes.
+- Duplicate check on subject and sent time; numbered names (`- 2`, `- 3`) for other emails with the same subject.
+- API for templates: `app.plugins.plugins["mail-for-outlook"].api` with `readEmailFromClipboard()` and `findArchivedName()`.
+- New settings section **Import**. **Person note type** and **Email property** are now always shown, since Import email uses them too.
+- Templates shipped in the release zip: `Email Template.md` (Templater) and `Email Template (fallback).md`.
 
 ### 1.3.1
 - Renamed to **Mail for Outlook**: new plugin id `mail-for-outlook`, command names "Send note as email", "Send selection as email", "Copy note as rich text" and "Copy selection as rich text". Settings and hotkeys from the "Mail" versions don't carry over.

@@ -16,8 +16,11 @@
  * Modified in 2026 for v1.3.1: renamed to Mail for Outlook (plugin id, commands, author);
  * settings grouped into sections; one progress notice per export; a second export can't start
  * while one is running.
+ * Modified in 2026 for v1.4.0: "Import email" command that turns an email copied from Outlook into a
+ * note through a Templater template, with a built-in token template when Templater is missing; people
+ * matched to person notes (by address, name or close name, with a review window); API for templates.
  */
-import { App, Plugin, PluginSettingTab, Setting, Notice, MarkdownRenderer, TFile, Component, normalizePath, FileSystemAdapter, Editor, MarkdownView, MarkdownFileInfo, getFrontMatterInfo, getLinkpath, resolveSubpath } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, Notice, MarkdownRenderer, TFile, TFolder, Component, Modal, ToggleComponent, normalizePath, FileSystemAdapter, Editor, MarkdownView, MarkdownFileInfo, getFrontMatterInfo, getLinkpath, resolveSubpath, htmlToMarkdown, parseFrontMatterAliases, moment } from 'obsidian';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -36,7 +39,111 @@ interface MailForOutlookSettings {
 	selectionRecipientScope: 'selection' | 'note';
 	safetyPlaceholderEnabled: boolean;
 	safetyPlaceholder: string;
+	// Import (1.4.0)
+	emailTemplate: string;
+	fallbackTemplate: string;
+	importFolder: string;
+	importPrefix: string;
+	sentProperty: string;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Import (1.4.0): API contract shared with the Templater template
+// ---------------------------------------------------------------------------------------------
+
+interface EmailPerson {
+	// Display name as shown by Outlook ("" if only an address)
+	name: string;
+	// null when Outlook showed only a name
+	address: string | null;
+	// "[[Note basename]]" if matched; else "[[address]]"; else the plain name (no brackets)
+	link: string;
+}
+
+interface ParsedEmail {
+	// As in the header, prefixes (RE:, TR:, FW:) kept
+	subject: string;
+	// "YYYY-MM-DD HH:mm", null if the date can't be parsed
+	sent: string | null;
+	// The date text as found
+	sentRaw: string;
+	// [] when the field is absent
+	from: EmailPerson[];
+	to: EmailPerson[];
+	cc: EmailPerson[];
+	// The header block alone, as markdown
+	header: string;
+	// Markdown from the header block (included) to the end
+	body: string;
+}
+
+interface FindArchivedNameOptions {
+	folder: string;
+	baseName: string;
+	sentProperty: string;
+	sent: string | null;
+}
+
+interface ArchivedName {
+	name: string;
+	duplicate: TFile | null;
+}
+
+interface MailForOutlookApi {
+	version: number;
+	readEmailFromClipboard(): Promise<ParsedEmail | null>;
+	findArchivedName(options: FindArchivedNameOptions): ArchivedName;
+}
+
+// A person as read from the header, before matching to person notes.
+interface RawPerson {
+	name: string;
+	address: string | null;
+}
+
+// The header and body found on the clipboard, before matching.
+interface ParsedHeader {
+	subject: string;
+	sent: string | null;
+	sentRaw: string;
+	from: RawPerson[];
+	to: RawPerson[];
+	cc: RawPerson[];
+	header: string;
+	body: string;
+}
+
+type HeaderField = 'from' | 'sent' | 'to' | 'cc' | 'subject';
+
+// A person note, indexed once per import from the metadata cache.
+interface PersonNote {
+	file: TFile;
+	// Lowercase addresses from the email property
+	addresses: Set<string>;
+	// Normalized words of the file name and of each alias
+	names: string[][];
+}
+
+// One person to confirm in the review window.
+interface ReviewRow {
+	key: string;
+	person: RawPerson;
+	candidates: TFile[];
+	// true for an exact name match, false for closest names
+	exact: boolean;
+}
+
+interface ReviewChoice {
+	file: TFile | null;
+	addAddress: boolean;
+}
+
+// Templater's internal object (not a documented API): checked at every call.
+interface TemplaterInternals {
+	create_new_note_from_template?: unknown;
+}
+
+type CreateNoteFromTemplate = (template: TFile, folder?: string, filename?: string, openNewNote?: boolean) => Promise<unknown>;
 
 // Where an export goes: an email draft, or the clipboard as rich text.
 type ExportTarget = 'email' | 'clipboard';
@@ -112,7 +219,12 @@ const DEFAULT_SETTINGS: MailForOutlookSettings = {
 	recipientsFromText: true,
 	selectionRecipientScope: 'selection',
 	safetyPlaceholderEnabled: false,
-	safetyPlaceholder: 'REMOVE-BEFORE-SENDING'
+	safetyPlaceholder: 'REMOVE-BEFORE-SENDING',
+	emailTemplate: '',
+	fallbackTemplate: '',
+	importFolder: '2 Mail/Liste Emails',
+	importPrefix: '✉️ ',
+	sentProperty: 'Envoyé:'
 }
 
 // Exported drafts live in their own temp subfolder and are deleted once this old.
@@ -141,13 +253,71 @@ const NOTICE_DONE_MS = 4000;
 const NOTICE_WARNING_MS = 10000;
 const NOTICE_ERROR_MS = 8000;
 
+// Import (1.4.0)
+const TEMPLATER_ID = 'templater-obsidian';
+// The header block: a From line followed, within this many non-empty lines, by Sent and Subject
+const HEADER_WINDOW = 6;
+// Closest-name candidates: minimum similarity (0 to 1) and how many are offered
+const NAME_MATCH_THRESHOLD = 0.75;
+const MAX_NAME_CANDIDATES = 3;
+// Above this many words, words are paired greedily instead of trying every pairing
+const MAX_EXHAUSTIVE_WORDS = 6;
+// Removed from titles: not allowed in file names, or breaking the "# [[…]]" heading link
+const TITLE_ILLEGAL = /[\\/:*?"<>|#@%;[\]^]/g;
+// Name for a note whose title was left empty
+const UNTITLED = 'Untitled';
+const HEADER_LABELS: Record<string, HeaderField> = {
+	de: 'from', from: 'from',
+	envoye: 'sent', sent: 'sent', date: 'sent',
+	a: 'to', to: 'to',
+	cc: 'cc',
+	objet: 'subject', subject: 'subject'
+};
+// A label at the start of a header line ("Envoyé :", "Importance:"); any space before ":" is allowed
+const LABEL_LINE = /^(\p{L}[\p{L} -]{0,30}?)\s*:\s*(.*)$/u;
+const MONTHS: Record<string, number> = {
+	janvier: 1, fevrier: 2, mars: 3, avril: 4, mai: 5, juin: 6,
+	juillet: 7, aout: 8, septembre: 9, octobre: 10, novembre: 11, decembre: 12,
+	january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+	july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+	jan: 1, feb: 2, mar: 3, apr: 4, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12
+};
+// Built-in fallback template, used when no fallback template is set
+const DEFAULT_FALLBACK_TEMPLATE = [
+	'---',
+	'Type:',
+	'  - e-mail',
+	'Creation date: {{today:YYYY-MM-DD}}',
+	'"Envoyé:": {{sent}}',
+	'"De:": {{from}}',
+	'"A:": {{to}}',
+	'"Cc:": {{cc}}',
+	'Objet: {{subject}}',
+	'Tags: []',
+	'Comment: ""',
+	'---',
+	'',
+	'# [[{{title}}]]',
+	'',
+	'{{body}}',
+	''
+].join('\n');
+
 export default class MailForOutlookPlugin extends Plugin {
 	settings: MailForOutlookSettings;
 	// True while an export runs, so a second one can't start
 	private exporting = false;
+	// Reached from templates as app.plugins.plugins["mail-for-outlook"]?.api
+	api: MailForOutlookApi | undefined;
 
 	async onload() {
 		await this.loadSettings();
+
+		this.api = {
+			version: 1,
+			readEmailFromClipboard: () => this.readEmailFromClipboard(),
+			findArchivedName: (options: FindArchivedNameOptions) => this.findArchivedName(options)
+		};
 
 		// Remove drafts left over from a previous session.
 		void this.cleanupTempFiles();
@@ -199,7 +369,19 @@ export default class MailForOutlookPlugin extends Plugin {
 			}
 		});
 
+		this.addCommand({
+			id: 'import-email',
+			name: 'Import email',
+			callback: async () => {
+				await this.importEmail();
+			}
+		});
+
 		this.addSettingTab(new MailForOutlookSettingTab(this.app, this));
+	}
+
+	onunload() {
+		this.api = undefined;
 	}
 
 	async exportActiveNote(target: ExportTarget = 'email') {
@@ -926,6 +1108,306 @@ export default class MailForOutlookPlugin extends Plugin {
 		}
 	}
 
+	// -----------------------------------------------------------------------------------------
+	// Import (1.4.0)
+	// -----------------------------------------------------------------------------------------
+
+	// The Import email command: through the Templater template when possible, otherwise the built-in fallback.
+	async importEmail(): Promise<void> {
+		const templateFile = this.findVaultFile(this.settings.emailTemplate);
+		const createNote = this.getTemplaterCreate();
+		if (templateFile && createNote) {
+			try {
+				await createNote(templateFile, undefined, undefined, true);
+			} catch (error) {
+				// A half-made note may exist: no fallback, so there is never a second note
+				new Notice(`❌ Import failed: ${error instanceof Error ? error.message : String(error)}`, NOTICE_ERROR_MS);
+				console.error('Mail for Outlook import error:', error);
+			}
+			return;
+		}
+		new Notice('Templater indisponible — modèle de secours utilisé');
+		await this.importWithFallback();
+	}
+
+	// Templater's create_new_note_from_template, if Templater is enabled and still has it.
+	private getTemplaterCreate(): CreateNoteFromTemplate | null {
+		const plugins = (this.app as unknown as { plugins?: { plugins?: Record<string, unknown> } }).plugins?.plugins;
+		const templater = (plugins?.[TEMPLATER_ID] as { templater?: TemplaterInternals } | undefined)?.templater;
+		if (!templater || typeof templater.create_new_note_from_template !== 'function') return null;
+		const internals = templater as { create_new_note_from_template: CreateNoteFromTemplate };
+		return (template, folder, filename, openNewNote) => internals.create_new_note_from_template(template, folder, filename, openNewNote);
+	}
+
+	// The file at a path from the settings; ".md" may be left out.
+	private findVaultFile(setting: string): TFile | null {
+		const trimmed = setting.trim();
+		if (!trimmed) return null;
+		const vaultPath = normalizePath(trimmed);
+		for (const candidate of [vaultPath, `${vaultPath}.md`]) {
+			const file = this.app.vault.getAbstractFileByPath(candidate);
+			if (file instanceof TFile) return file;
+		}
+		return null;
+	}
+
+	// Import without Templater: the fallback token template, filled and saved by the plugin.
+	private async importWithFallback(): Promise<void> {
+		try {
+			const email = await this.readEmailFromClipboard();
+			const answer = await new TitleModal(this.app, 'Titre de l\'email (Objet) :', email ? sanitizeTitle(email.subject) : '').openAndWait();
+			if (answer === null) {
+				new Notice('⛔ Import annulé');
+				return;
+			}
+			const title = sanitizeTitle(answer) || UNTITLED;
+			const folder = normalizeFolder(this.settings.importFolder);
+			const archived = this.findArchivedName({
+				folder,
+				baseName: this.settings.importPrefix + title,
+				sentProperty: this.settings.sentProperty,
+				sent: email ? email.sent : null
+			});
+			if (archived.duplicate) {
+				const importAnyway = await new ChoiceModal(this.app, `Cet e-mail est déjà archivé : ${archived.duplicate.basename}`, '⛔ Annuler', '✅ Importer quand même').openAndWait();
+				if (!importAnyway) {
+					new Notice('⛔ Import annulé');
+					return;
+				}
+			}
+
+			const template = await this.readFallbackTemplate();
+			const frontmatter = getFrontMatterInfo(template);
+			const content = fillTemplate(template, frontmatter.exists ? frontmatter.contentStart : 0, archived.name, email, format => moment().format(format));
+
+			if (folder && !this.app.vault.getAbstractFileByPath(folder)) {
+				await this.app.vault.createFolder(folder);
+			}
+			const file = await this.app.vault.create(normalizePath(`${folder}/${archived.name}.md`), content);
+			await this.app.workspace.getLeaf(false).openFile(file);
+		} catch (error) {
+			new Notice(`❌ Import failed: ${error instanceof Error ? error.message : String(error)}`, NOTICE_ERROR_MS);
+			console.error('Mail for Outlook import error:', error);
+		}
+	}
+
+	// The fallback template file, or the built-in default when none is set or it can't be found.
+	private async readFallbackTemplate(): Promise<string> {
+		if (!this.settings.fallbackTemplate.trim()) return DEFAULT_FALLBACK_TEMPLATE;
+		const file = this.findVaultFile(this.settings.fallbackTemplate);
+		if (!file) {
+			new Notice(`⚠️ Fallback template not found: ${this.settings.fallbackTemplate} — built-in default used`, NOTICE_WARNING_MS);
+			return DEFAULT_FALLBACK_TEMPLATE;
+		}
+		return this.app.vault.read(file);
+	}
+
+	// API: the email on the clipboard with its people matched to person notes, or null when the
+	// clipboard holds no Outlook header (or can't be read).
+	async readEmailFromClipboard(): Promise<ParsedEmail | null> {
+		let markdown: string;
+		try {
+			markdown = await this.readClipboardAsMarkdown();
+		} catch (error) {
+			new Notice(`❌ Couldn't read the clipboard: ${error instanceof Error ? error.message : String(error)}`, NOTICE_ERROR_MS);
+			console.error('Mail for Outlook clipboard error:', error);
+			return null;
+		}
+		const parsed = parseEmail(markdown);
+		if (!parsed) return null;
+
+		const links = await this.linkPeople([...parsed.from, ...parsed.to, ...parsed.cc]);
+		const toEmailPeople = (people: RawPerson[]): EmailPerson[] => {
+			const seen = new Set<string>();
+			const result: EmailPerson[] = [];
+			for (const person of people) {
+				const link = links.get(personKey(person)) ?? fallbackLink(person);
+				// The same note appearing twice in one list is kept once
+				if (seen.has(link)) continue;
+				seen.add(link);
+				result.push({ name: person.name, address: person.address, link });
+			}
+			return result;
+		};
+		return {
+			subject: parsed.subject,
+			sent: parsed.sent,
+			sentRaw: parsed.sentRaw,
+			from: toEmailPeople(parsed.from),
+			to: toEmailPeople(parsed.to),
+			cc: toEmailPeople(parsed.cc),
+			header: parsed.header,
+			body: parsed.body
+		};
+	}
+
+	// HTML when the clipboard has it (images removed, then converted to markdown), otherwise plain text.
+	private async readClipboardAsMarkdown(): Promise<string> {
+		const items = await navigator.clipboard.read();
+		const htmlItem = items.find(item => item.types.includes('text/html'));
+		if (htmlItem) {
+			const html = await (await htmlItem.getType('text/html')).text();
+			const doc = new DOMParser().parseFromString(html, 'text/html');
+			// Images are not imported, so no attachment files are created; style and script text is not content
+			for (const element of Array.from(doc.querySelectorAll('img, style, script, title'))) {
+				element.remove();
+			}
+			return htmlToMarkdown(doc.body);
+		}
+		const textItem = items.find(item => item.types.includes('text/plain'));
+		return textItem ? (await textItem.getType('text/plain')).text() : '';
+	}
+
+	// Links for each person, keyed by personKey: by address, then exact name, then closest names.
+	// People matched by name go through the review window first.
+	private async linkPeople(people: RawPerson[]): Promise<Map<string, string>> {
+		const links = new Map<string, string>();
+		const rows: ReviewRow[] = [];
+		const notes = this.buildPersonIndex();
+
+		for (const person of people) {
+			const key = personKey(person);
+			if (links.has(key) || rows.some(row => row.key === key)) continue;
+
+			// 1. By address: linked directly
+			if (person.address) {
+				const address = person.address.toLowerCase();
+				const note = notes.find(n => n.addresses.has(address));
+				if (note) {
+					links.set(key, `[[${note.file.basename}]]`);
+					continue;
+				}
+			}
+
+			// 2. By name, as an unordered set of words; 3. closest names if nothing matched
+			const words = nameWords(person.name);
+			if (words.length > 0) {
+				const exact = notes.filter(n => n.names.some(names => sameWords(names, words)));
+				if (exact.length > 0) {
+					rows.push({ key, person, candidates: exact.map(n => n.file), exact: true });
+					continue;
+				}
+				const close = notes
+					.map(n => ({ file: n.file, score: Math.max(0, ...n.names.map(names => wordSetSimilarity(names, words))) }))
+					.filter(c => c.score >= NAME_MATCH_THRESHOLD)
+					.sort((a, b) => b.score - a.score)
+					.slice(0, MAX_NAME_CANDIDATES);
+				if (close.length > 0) {
+					rows.push({ key, person, candidates: close.map(c => c.file), exact: false });
+					continue;
+				}
+			}
+
+			// No candidate at all (e.g. an external contact)
+			links.set(key, fallbackLink(person));
+		}
+
+		if (rows.length === 0) return links;
+
+		const choices = await new PeopleReviewModal(this.app, rows).openAndWait();
+		const changed = new Set<string>();
+		for (const row of rows) {
+			const choice = choices?.get(row.key);
+			if (!choice || !choice.file) {
+				// Skip, Escape or "No note"
+				links.set(row.key, fallbackLink(row.person));
+				continue;
+			}
+			links.set(row.key, `[[${choice.file.basename}]]`);
+			if (choice.addAddress && row.person.address && await this.addAddressToNote(choice.file, row.person.address)) {
+				changed.add(choice.file.path);
+			}
+		}
+		if (changed.size > 0) {
+			new Notice(`Address added to ${changed.size} person note${changed.size === 1 ? '' : 's'}`);
+		}
+		return links;
+	}
+
+	// Person notes (same rules as recipients), read from the metadata cache only.
+	private buildPersonIndex(): PersonNote[] {
+		const personType = this.normalizeValue(this.settings.personType);
+		const notes: PersonNote[] = [];
+		if (!personType) return notes;
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
+			if (!frontmatter) continue;
+			const types = this.toStringList(this.getProperty(frontmatter, 'type')).map(value => this.normalizeValue(value));
+			if (!types.includes(personType)) continue;
+			const addresses = new Set(this.toStringList(this.getProperty(frontmatter, this.settings.emailProperty))
+				.map(normalizeAddressValue)
+				.filter(address => address !== ''));
+			const names = [file.basename, ...(parseFrontMatterAliases(frontmatter) ?? [])]
+				.map(nameWords)
+				.filter(words => words.length > 0);
+			notes.push({ file, addresses, names });
+		}
+		return notes;
+	}
+
+	// Adds an address to a person note's email property; returns whether the note changed.
+	// Other values and properties are never changed.
+	private async addAddressToNote(file: TFile, address: string): Promise<boolean> {
+		const wanted = this.settings.emailProperty.trim();
+		if (!wanted) return false;
+		let added = false;
+		await this.app.fileManager.processFrontMatter(file, (frontmatter: Record<string, unknown>) => {
+			const key = Object.keys(frontmatter).find(k => k.toLowerCase() === wanted.toLowerCase()) ?? wanted;
+			const value = frontmatter[key];
+			const lower = address.toLowerCase();
+			if (value === undefined || value === null || value === '') {
+				frontmatter[key] = [address];
+				added = true;
+			} else if (typeof value === 'string') {
+				if (normalizeAddressValue(value) !== lower) {
+					frontmatter[key] = [value, address];
+					added = true;
+				}
+			} else if (Array.isArray(value)) {
+				if (!value.some(item => typeof item === 'string' && normalizeAddressValue(item) === lower)) {
+					value.push(address);
+					added = true;
+				}
+			}
+		});
+		return added;
+	}
+
+	// API: the name to archive an email under, and an archived note with the same sent time if any.
+	findArchivedName(options: FindArchivedNameOptions): ArchivedName {
+		const folderPath = normalizeFolder(String(options.folder ?? ''));
+		const baseName = String(options.baseName ?? '');
+		const sent = normalizeSentValue(options.sent);
+		const folder = folderPath ? this.app.vault.getAbstractFileByPath(folderPath) : this.app.vault.getRoot();
+
+		// Notes named baseName (number 1) or "baseName - N"; compared without regard to case,
+		// since Windows and macOS file systems would treat them as the same file
+		const existing = new Map<number, TFile>();
+		if (folder instanceof TFolder) {
+			for (const child of folder.children) {
+				if (!(child instanceof TFile) || child.extension !== 'md') continue;
+				const number = archiveNumber(child.basename, baseName);
+				if (number !== null && !existing.has(number)) existing.set(number, child);
+			}
+		}
+
+		let duplicate: TFile | null = null;
+		if (sent) {
+			for (const number of Array.from(existing.keys()).sort((a, b) => a - b)) {
+				const file = existing.get(number);
+				const frontmatter = file ? this.app.metadataCache.getFileCache(file)?.frontmatter : undefined;
+				if (file && frontmatter && normalizeSentValue(this.getProperty(frontmatter, options.sentProperty)) === sent) {
+					duplicate = file;
+					break;
+				}
+			}
+		}
+
+		let number = 1;
+		while (existing.has(number)) number = number === 1 ? 2 : number + 1;
+		return { name: number === 1 ? baseName : `${baseName} - ${number}`, duplicate };
+	}
+
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MailForOutlookSettings>);
 	}
@@ -1233,6 +1715,339 @@ function sanitizePlaceholder(text: string): string {
 	return cleaned || DEFAULT_SETTINGS.safetyPlaceholder;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Import helpers (1.4.0)
+// ---------------------------------------------------------------------------------------------
+
+// A vault folder path from a setting or a template: leading and trailing slashes removed, "" for the root.
+function normalizeFolder(folder: string): string {
+	const normalized = normalizePath(folder.trim());
+	return normalized === '/' ? '' : normalized;
+}
+
+// A subject made usable as a file name and inside the "# [[…]]" heading link.
+function sanitizeTitle(text: string): string {
+	return text.replace(TITLE_ILLEGAL, '').trim();
+}
+
+// Lowercase, without accents.
+function foldText(text: string): string {
+	return text.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+}
+
+// One markdown line made plain for header parsing; the body keeps its markdown.
+function normalizeHeaderLine(line: string): string {
+	return line
+		.replace(/[\u00A0\u202F\u2007]/g, ' ')
+		.replace(/^(?:[ \t]*>)+[ \t]?/, '')
+		.replace(/\*\*|__/g, '')
+		.replace(/\\([\\`*_{}[\]()#+\-.!<>|~=])/g, '$1')
+		.replace(/\[([^\]]*)\]\(\s*<?mailto:([^)\s>]+)>?\s*\)/gi, '$2')
+		.replace(/<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?\/?>/g, '')
+		.trim();
+}
+
+// The label of a header line: a known field, null for another label ("Importance :"),
+// undefined when the line starts with no label.
+function headerLabel(line: string): HeaderField | null | undefined {
+	const match = line.match(LABEL_LINE);
+	if (!match) return undefined;
+	return HEADER_LABELS[foldText(match[1].trim())] ?? null;
+}
+
+// The first From line followed, within the next HEADER_WINDOW non-empty lines, by a Sent line
+// and then a Subject line. The block ends at the Subject line.
+function findHeaderBlock(lines: string[]): { start: number; end: number } | null {
+	for (let i = 0; i < lines.length; i++) {
+		if (headerLabel(lines[i]) !== 'from') continue;
+		let seenSent = false;
+		let count = 0;
+		for (let j = i + 1; j < lines.length && count < HEADER_WINDOW; j++) {
+			if (lines[j] === '') continue;
+			count++;
+			const label = headerLabel(lines[j]);
+			if (label === 'sent') {
+				seenSent = true;
+			} else if (label === 'subject') {
+				if (seenSent) return { start: i, end: j };
+				break;
+			} else if (label === 'from') {
+				break;
+			}
+		}
+	}
+	return null;
+}
+
+// Finds the Outlook header in clipboard markdown and reads its fields; null when there is none.
+// Everything above the header (the forward draft, a signature, Outlook's separator) is discarded.
+function parseEmail(markdown: string): ParsedHeader | null {
+	const lines = markdown.replace(/\r\n?/g, '\n').split('\n');
+	const clean = lines.map(normalizeHeaderLine);
+	const block = findHeaderBlock(clean);
+	if (!block) return null;
+
+	// Fields are read only inside the block; a line with no label continues the previous field,
+	// and a line with an unknown label (and what continues it) is ignored
+	const fields: Partial<Record<HeaderField, string>> = {};
+	let current: HeaderField | null = null;
+	for (let i = block.start; i <= block.end; i++) {
+		const line = clean[i];
+		if (line === '') continue;
+		const label = headerLabel(line);
+		if (label === undefined) {
+			if (current) fields[current] = `${fields[current] ?? ''} ${line}`.trim();
+			continue;
+		}
+		if (label === null || fields[label] !== undefined) {
+			current = null;
+			continue;
+		}
+		current = label;
+		fields[label] = (line.match(LABEL_LINE)?.[2] ?? '').trim();
+	}
+
+	const sentRaw = fields.sent ?? '';
+	return {
+		subject: fields.subject ?? '',
+		sent: parseSentDate(sentRaw),
+		sentRaw,
+		from: parsePeople(fields.from ?? ''),
+		to: parsePeople(fields.to ?? ''),
+		cc: parsePeople(fields.cc ?? ''),
+		header: lines.slice(block.start, block.end + 1).join('\n'),
+		body: lines.slice(block.start).join('\n').trimEnd()
+	};
+}
+
+// "YYYY-MM-DD HH:mm" from French long, English long or numeric (day first) dates; null if unparseable.
+function parseSentDate(raw: string): string | null {
+	const text = foldText(raw).replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
+	const time = '\\s+(?:a\\s+|at\\s+)?(\\d{1,2})[:h](\\d{2})(?:\\s*([ap])\\.?m\\.?)?';
+	let day: number;
+	let month: number;
+	let year: number;
+	let hourText: string;
+	let minuteText: string;
+	let meridiem: string | undefined;
+
+	let match = text.match(new RegExp(`(\\d{1,2})[./](\\d{1,2})[./](\\d{4})${time}`));
+	if (match) {
+		[day, month, year] = [Number(match[1]), Number(match[2]), Number(match[3])];
+		[hourText, minuteText, meridiem] = [match[4], match[5], match[6]];
+	} else if ((match = text.match(new RegExp(`(\\d{1,2})(?:er)?\\.?\\s+([a-z]+)\\.?\\s+(\\d{4})${time}`))) && MONTHS[match[2]]) {
+		[day, month, year] = [Number(match[1]), MONTHS[match[2]], Number(match[3])];
+		[hourText, minuteText, meridiem] = [match[4], match[5], match[6]];
+	} else if ((match = text.match(new RegExp(`([a-z]+)\\.?\\s+(\\d{1,2})\\s+(\\d{4})${time}`))) && MONTHS[match[1]]) {
+		[day, month, year] = [Number(match[2]), MONTHS[match[1]], Number(match[3])];
+		[hourText, minuteText, meridiem] = [match[4], match[5], match[6]];
+	} else {
+		return null;
+	}
+
+	let hour = Number(hourText);
+	const minute = Number(minuteText);
+	if (meridiem) {
+		if (hour < 1 || hour > 12) return null;
+		hour = hour % 12 + (meridiem === 'p' ? 12 : 0);
+	}
+	const check = new Date(year, month - 1, day);
+	if (month < 1 || month > 12 || check.getDate() !== day || check.getMonth() !== month - 1 || hour > 23 || minute > 59) {
+		return null;
+	}
+	const pad = (n: number) => String(n).padStart(2, '0');
+	return `${year}-${pad(month)}-${pad(day)} ${pad(hour)}:${pad(minute)}`;
+}
+
+// People of a From / To / Cc field. Entries are split on ";"; without ";", several <…@…> are split
+// after each ">" followed by "," (a comma alone is not a separator: "Lastname, Firstname").
+function parsePeople(value: string): RawPerson[] {
+	const text = value.trim();
+	if (!text) return [];
+	let entries: string[];
+	if (text.includes(';')) {
+		entries = text.split(';');
+	} else if ((text.match(/<[^<>]*@[^<>]*>/g) ?? []).length > 1) {
+		entries = text.split(/>\s*,/).map((part, i, parts) => i < parts.length - 1 ? `${part}>` : part);
+	} else {
+		entries = [text];
+	}
+	const people: RawPerson[] = [];
+	for (const entry of entries) {
+		const person = parsePerson(entry);
+		if (person) people.push(person);
+	}
+	return people;
+}
+
+// Address inside <>, or a bare address, or mailto:; name = text before it, quotes removed.
+function parsePerson(entry: string): RawPerson | null {
+	const text = entry.trim();
+	if (!text) return null;
+	let name: string;
+	let address: string | null = null;
+	const bracketed = text.match(/<([^<>]*)>/);
+	if (bracketed) {
+		address = cleanAddress(bracketed[1]);
+		name = text.slice(0, bracketed.index);
+	} else {
+		const bare = text.match(/(?:mailto:)?[^\s<>"';,]+@[^\s<>"';,]+/i);
+		if (bare) {
+			address = cleanAddress(bare[0]);
+			name = text.slice(0, bare.index);
+		} else {
+			name = text;
+		}
+	}
+	name = name.replace(/["“”«»]/g, '').replace(/^\s*'+|'+\s*$/g, '').trim();
+	// Outlook sometimes repeats the address as the name
+	if (address && name.toLowerCase() === address.toLowerCase()) name = '';
+	if (!name && !address) return null;
+	return { name, address };
+}
+
+function cleanAddress(text: string): string | null {
+	const address = text.trim().replace(/^mailto:/i, '').trim();
+	return EMAIL_PATTERN.test(address) ? address : null;
+}
+
+// An address from a person note's email property: "x", "mailto:x" or "[x](mailto:x)", lowercased.
+function normalizeAddressValue(value: string): string {
+	const link = value.match(/\]\(\s*<?mailto:([^)\s>]+)>?\s*\)/i);
+	return (link ? link[1] : value).trim().replace(/^<|>$/g, '').replace(/^mailto:/i, '').trim().toLowerCase();
+}
+
+// Display name or note name as words: (…) and […] segments, quotes and commas removed, no accents,
+// lowercase. Hyphenated names stay one word.
+function nameWords(name: string): string[] {
+	const text = foldText(name.replace(/\([^)]*\)|\[[^\]]*\]/g, ' ').replace(/["'“”‘’«»,]/g, ' '));
+	return Array.from(new Set(text.split(/\s+/).filter(word => word !== '')));
+}
+
+function sameWords(a: string[], b: string[]): boolean {
+	return a.length === b.length && a.every(word => b.includes(word));
+}
+
+function levenshtein(a: string, b: string): number {
+	let previous = Array.from({ length: b.length + 1 }, (_, j) => j);
+	for (let i = 1; i <= a.length; i++) {
+		const current = [i];
+		for (let j = 1; j <= b.length; j++) {
+			current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+		}
+		previous = current;
+	}
+	return previous[b.length];
+}
+
+// 1 for identical words, 0 for nothing in common.
+function wordSimilarity(a: string, b: string): number {
+	const length = Math.max(a.length, b.length);
+	return length === 0 ? 1 : 1 - levenshtein(a, b) / length;
+}
+
+// Similarity of two names as word sets: the best pairing of their words, averaged over the longer
+// name, so a missing or extra word counts as 0.
+function wordSetSimilarity(a: string[], b: string[]): number {
+	const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+	if (long.length === 0) return 0;
+	const scores = short.map(x => long.map(y => wordSimilarity(x, y)));
+	let best = 0;
+	if (long.length <= MAX_EXHAUSTIVE_WORDS) {
+		const used = new Array<boolean>(long.length).fill(false);
+		const visit = (i: number, total: number) => {
+			if (i === short.length) {
+				best = Math.max(best, total);
+				return;
+			}
+			for (let j = 0; j < long.length; j++) {
+				if (used[j]) continue;
+				used[j] = true;
+				visit(i + 1, total + scores[i][j]);
+				used[j] = false;
+			}
+		};
+		visit(0, 0);
+	} else {
+		const used = new Set<number>();
+		for (const row of scores) {
+			let pick = -1;
+			row.forEach((score, j) => {
+				if (!used.has(j) && (pick < 0 || score > row[pick])) pick = j;
+			});
+			if (pick >= 0) {
+				used.add(pick);
+				best += row[pick];
+			}
+		}
+	}
+	return best / long.length;
+}
+
+// One key per person, so a person appearing in several fields is matched and reviewed once.
+function personKey(person: RawPerson): string {
+	return person.address ? `address:${person.address.toLowerCase()}` : `name:${nameWords(person.name).join(' ')}`;
+}
+
+// The link of a person with no person note: "[[address]]", or the plain name.
+function fallbackLink(person: RawPerson): string {
+	return person.address ? `[[${person.address}]]` : person.name;
+}
+
+// 1 for a note named baseName, N for "baseName - N" (N ≥ 2), null otherwise; case is ignored.
+function archiveNumber(name: string, baseName: string): number | null {
+	const lowerName = name.toLowerCase();
+	const lowerBase = baseName.toLowerCase();
+	if (lowerName === lowerBase) return 1;
+	if (!lowerName.startsWith(`${lowerBase} - `)) return null;
+	const suffix = lowerName.slice(lowerBase.length + 3);
+	if (!/^\d+$/.test(suffix)) return null;
+	const number = Number(suffix);
+	return number >= 2 ? number : null;
+}
+
+// A sent date as "YYYY-MM-DD HH:mm", from a string or a Date property value; null otherwise.
+function normalizeSentValue(value: unknown): string | null {
+	if (value instanceof Date) {
+		if (isNaN(value.getTime())) return null;
+		// YAML timestamps without a time zone are UTC
+		value = value.toISOString();
+	}
+	if (typeof value !== 'string') return null;
+	const match = value.trim().match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+	return match ? `${match[1]}-${match[2]}-${match[3]} ${match[4]}:${match[5]}` : null;
+}
+
+// Replaces the fallback template's tokens in one pass: replacement text is never parsed again,
+// unknown {{…}} text and <%…%> are left as they are. Tokens before `frontmatterEnd` are written
+// as YAML values: text as a double-quoted string, people as a flow list of quoted links.
+function fillTemplate(template: string, frontmatterEnd: number, title: string, email: ParsedEmail | null, today: (format: string) => string): string {
+	const texts: Record<string, string> = {
+		title,
+		subject: email ? email.subject : '',
+		sent: email?.sent ?? '',
+		body: email ? email.body : ''
+	};
+	const people: Record<string, string[]> = {
+		from: email ? email.from.map(p => p.link) : [],
+		to: email ? email.to.map(p => p.link) : [],
+		cc: email ? email.cc.map(p => p.link) : []
+	};
+	return template.replace(/\{\{(title|subject|sent|from|to|cc|body|today)(?::([^{}]*))?\}\}/g, (token: string, name: string, format: string | undefined, offset: number) => {
+		const inYaml = offset < frontmatterEnd;
+		if (name === 'today') {
+			const value = today(format?.trim() || 'YYYY-MM-DD');
+			return inYaml ? JSON.stringify(value) : value;
+		}
+		// Only {{today}} takes a format
+		if (format !== undefined) return token;
+		if (name in people) {
+			return inYaml ? `[${people[name].map(link => JSON.stringify(link)).join(', ')}]` : people[name].join(', ');
+		}
+		return inYaml ? JSON.stringify(texts[name]) : texts[name];
+	});
+}
+
 // A notice that stays on screen during an export, shows its progress, and ends with the result.
 class ProgressNotice {
 	private notice: Notice;
@@ -1255,6 +2070,183 @@ class ProgressNotice {
 		}
 		this.notice.setMessage(fragment);
 		window.setTimeout(() => this.notice.hide(), durationMs);
+	}
+}
+
+// Asks for the note title; resolves to null on Escape.
+class TitleModal extends Modal {
+	private resolve: ((value: string | null) => void) | null = null;
+	private value: string;
+
+	constructor(app: App, private prompt: string, initial: string) {
+		super(app);
+		this.value = initial;
+	}
+
+	openAndWait(): Promise<string | null> {
+		return new Promise(resolve => {
+			this.resolve = resolve;
+			this.open();
+		});
+	}
+
+	onOpen(): void {
+		this.setTitle(this.prompt);
+		new Setting(this.contentEl)
+			.addText(text => {
+				text.setValue(this.value).onChange(value => {
+					this.value = value;
+				});
+				text.inputEl.addEventListener('keydown', event => {
+					if (event.key === 'Enter' && !event.isComposing) {
+						event.preventDefault();
+						this.finish(this.value);
+					}
+				});
+				window.setTimeout(() => text.inputEl.select(), 0);
+			})
+			.addButton(button => button
+				.setButtonText('OK')
+				.setCta()
+				.onClick(() => this.finish(this.value)));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+		this.finish(null);
+	}
+
+	private finish(value: string | null): void {
+		const resolve = this.resolve;
+		this.resolve = null;
+		if (!resolve) return;
+		resolve(value);
+		this.close();
+	}
+}
+
+// A message with two choices; resolves to true for the second one, false for the first one or Escape.
+class ChoiceModal extends Modal {
+	private resolve: ((value: boolean) => void) | null = null;
+
+	constructor(app: App, private message: string, private cancelText: string, private confirmText: string) {
+		super(app);
+	}
+
+	openAndWait(): Promise<boolean> {
+		return new Promise(resolve => {
+			this.resolve = resolve;
+			this.open();
+		});
+	}
+
+	onOpen(): void {
+		this.contentEl.createEl('p', { text: this.message });
+		new Setting(this.contentEl)
+			.addButton(button => button
+				.setButtonText(this.cancelText)
+				.onClick(() => this.finish(false)))
+			.addButton(button => button
+				.setButtonText(this.confirmText)
+				.onClick(() => this.finish(true)));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+		this.finish(false);
+	}
+
+	private finish(value: boolean): void {
+		const resolve = this.resolve;
+		this.resolve = null;
+		if (!resolve) return;
+		resolve(value);
+		this.close();
+	}
+}
+
+// One window per import, for the people matched by name: choose their note, and whether to add
+// their address to it. Resolves to the choices on Confirm, null on Skip or Escape.
+class PeopleReviewModal extends Modal {
+	private resolve: ((value: Map<string, ReviewChoice> | null) => void) | null = null;
+	private choices = new Map<string, ReviewChoice>();
+
+	constructor(app: App, private rows: ReviewRow[]) {
+		super(app);
+	}
+
+	openAndWait(): Promise<Map<string, ReviewChoice> | null> {
+		return new Promise(resolve => {
+			this.resolve = resolve;
+			this.open();
+		});
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		this.setTitle('Link people to person notes');
+		contentEl.createEl('p', {
+			cls: 'setting-item-description',
+			text: 'These people were matched by name. Choose the note of each person; without a note, the address is kept.'
+		});
+
+		for (const row of this.rows) {
+			// An exact name match is likely right; a closest name less so
+			const choice: ReviewChoice = { file: row.candidates[0] ?? null, addAddress: row.exact };
+			this.choices.set(row.key, choice);
+			let toggle: ToggleComponent | null = null;
+
+			new Setting(contentEl)
+				.setName(row.person.name || row.person.address || '')
+				.setDesc(row.person.address ?? 'No address shown by Outlook')
+				.addDropdown(dropdown => {
+					row.candidates.forEach((file, index) => {
+						// Two notes with the same name are told apart by their path
+						const twin = row.candidates.some(other => other !== file && other.basename === file.basename);
+						dropdown.addOption(String(index), twin ? file.path : file.basename);
+					});
+					dropdown.addOption('', 'No note');
+					dropdown.setValue(row.candidates.length > 0 ? '0' : '');
+					dropdown.onChange(value => {
+						choice.file = value === '' ? null : row.candidates[Number(value)] ?? null;
+						toggle?.setDisabled(choice.file === null);
+					});
+				});
+
+			// No address, nothing to add
+			if (row.person.address) {
+				new Setting(contentEl)
+					.setName('Add this address to the note')
+					.addToggle(component => {
+						toggle = component;
+						component.setValue(choice.addAddress).onChange(value => {
+							choice.addAddress = value;
+						});
+					});
+			}
+		}
+
+		new Setting(contentEl)
+			.addButton(button => button
+				.setButtonText('Skip')
+				.onClick(() => this.finish(null)))
+			.addButton(button => button
+				.setButtonText('Confirm')
+				.setCta()
+				.onClick(() => this.finish(this.choices)));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+		this.finish(null);
+	}
+
+	private finish(value: Map<string, ReviewChoice> | null): void {
+		const resolve = this.resolve;
+		this.resolve = null;
+		if (!resolve) return;
+		resolve(value);
+		this.close();
 	}
 }
 
@@ -1351,33 +2343,30 @@ class MailForOutlookSettingTab extends PluginSettingTab {
 				.onChange(async (value) => {
 					this.plugin.settings.recipientsFromPersonNotes = value;
 					await this.plugin.saveSettings();
-					// Show or hide the person note settings
-					this.display();
 				}));
 
-		if (this.plugin.settings.recipientsFromPersonNotes) {
-			new Setting(containerEl)
-				.setName('Person note type')
-				.setDesc('Linked notes whose "type" property has this value are treated as people.')
-				.addText(text => text
-					.setPlaceholder(DEFAULT_SETTINGS.personType)
-					.setValue(this.plugin.settings.personType)
-					.onChange(async (value) => {
-						this.plugin.settings.personType = value;
-						await this.plugin.saveSettings();
-					}));
+		// Always shown: Import email uses them too, even when person notes are not used for recipients
+		new Setting(containerEl)
+			.setName('Person note type')
+			.setDesc('Notes whose "type" property has this value are treated as people: for recipients, and to link people when importing an email.')
+			.addText(text => text
+				.setPlaceholder(DEFAULT_SETTINGS.personType)
+				.setValue(this.plugin.settings.personType)
+				.onChange(async (value) => {
+					this.plugin.settings.personType = value;
+					await this.plugin.saveSettings();
+				}));
 
-			new Setting(containerEl)
-				.setName('Email property')
-				.setDesc('Property in person notes that holds their email address.')
-				.addText(text => text
-					.setPlaceholder(DEFAULT_SETTINGS.emailProperty)
-					.setValue(this.plugin.settings.emailProperty)
-					.onChange(async (value) => {
-						this.plugin.settings.emailProperty = value;
-						await this.plugin.saveSettings();
-					}));
-		}
+		new Setting(containerEl)
+			.setName('Email property')
+			.setDesc('Property in person notes that holds their email addresses: for recipients, and to match people when importing an email. Addresses you confirm on import are added to it.')
+			.addText(text => text
+				.setPlaceholder(DEFAULT_SETTINGS.emailProperty)
+				.setValue(this.plugin.settings.emailProperty)
+				.onChange(async (value) => {
+					this.plugin.settings.emailProperty = value;
+					await this.plugin.saveSettings();
+				}));
 
 		new Setting(containerEl)
 			.setName('From addresses in the text')
@@ -1398,6 +2387,67 @@ class MailForOutlookSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.selectionRecipientScope)
 				.onChange(async (value) => {
 					this.plugin.settings.selectionRecipientScope = value === 'note' ? 'note' : 'selection';
+					await this.plugin.saveSettings();
+				}));
+
+		// Import: the Import email command
+		new Setting(containerEl)
+			.setName('Import')
+			.setDesc('The Import email command turns an email copied from Outlook into a note. People are linked to person notes using the two settings above.')
+			.setHeading();
+
+		new Setting(containerEl)
+			.setName('Email template (Templater)')
+			.setDesc('Path of the Templater template that creates the note. Empty, or Templater not enabled: the fallback template is used.')
+			.addText(text => text
+				.setPlaceholder('Templates/Email Template.md')
+				.setValue(this.plugin.settings.emailTemplate)
+				.onChange(async (value) => {
+					this.plugin.settings.emailTemplate = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Fallback template')
+			.setDesc('Path of the {{token}} template used without Templater. Empty: the built-in default.')
+			.addText(text => text
+				.setPlaceholder('Templates/Email Template (fallback).md')
+				.setValue(this.plugin.settings.fallbackTemplate)
+				.onChange(async (value) => {
+					this.plugin.settings.fallbackTemplate = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Destination folder')
+			.setDesc('Folder for imported emails. Fallback only: the Templater template sets its own.')
+			.addText(text => text
+				.setPlaceholder(DEFAULT_SETTINGS.importFolder)
+				.setValue(this.plugin.settings.importFolder)
+				.onChange(async (value) => {
+					this.plugin.settings.importFolder = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('File name prefix')
+			.setDesc('Put before the title in the note name. Fallback only.')
+			.addText(text => text
+				.setPlaceholder(DEFAULT_SETTINGS.importPrefix)
+				.setValue(this.plugin.settings.importPrefix)
+				.onChange(async (value) => {
+					this.plugin.settings.importPrefix = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Sent property')
+			.setDesc('Property holding the sent date, used by the fallback to recognise an email that is already archived.')
+			.addText(text => text
+				.setPlaceholder(DEFAULT_SETTINGS.sentProperty)
+				.setValue(this.plugin.settings.sentProperty)
+				.onChange(async (value) => {
+					this.plugin.settings.sentProperty = value;
 					await this.plugin.saveSettings();
 				}));
 	}
